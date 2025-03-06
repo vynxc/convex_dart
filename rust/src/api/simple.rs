@@ -29,7 +29,7 @@ use log::debug;
 #[cfg(debug_assertions)]
 use log::LevelFilter;
 use parking_lot::Mutex;
-use flutter_rust_bridge::frb;
+use flutter_rust_bridge::{frb, DartFnFuture};
 
 #[derive(Debug, thiserror::Error)]
 #[frb]
@@ -97,6 +97,28 @@ impl SubscriptionHandle {
     }
 }
 
+pub struct CallbackSubscriberDartFn {
+    on_update: Box<dyn Fn(String) -> DartFnFuture<()> + Send + Sync>,
+    on_error: Box<dyn Fn(String, Option<String>) -> DartFnFuture<()> + Send + Sync>,
+}
+
+impl QuerySubscriber for CallbackSubscriberDartFn {
+    fn on_update(&self, value: String) {
+        // Since on_update returns a Future, we need to spawn it
+        let future = (self.on_update)(value);
+        tokio::spawn(async move {
+            let _ = future.await; // We don't need the result, but we need to await it
+        });
+    }
+
+    fn on_error(&self, message: String, value: Option<String>) {
+        let future = (self.on_error)(message, value);
+        tokio::spawn(async move {
+            let _ = future.await;
+        });
+    }
+}
+
 #[frb(opaque)]
 pub struct MobileConvexClient {
     deployment_url: String,
@@ -158,10 +180,10 @@ impl MobileConvexClient {
         &self,
         name: String,
         args: HashMap<String, String>,
-        on_update: impl Fn(String) + Send + Sync + 'static,
-        on_error: impl Fn(String, Option<String>) + Send + Sync + 'static,
+        on_update: impl Fn(String) -> DartFnFuture<()> + Send + Sync + 'static,
+        on_error: impl Fn(String, Option<String>) -> DartFnFuture<()> + Send + Sync + 'static,
     ) -> Result<Arc<SubscriptionHandle>, ClientError> {
-        let subscriber = Arc::new(CallbackSubscriber {
+        let subscriber = Arc::new(CallbackSubscriberDartFn {
             on_update: Box::new(on_update),
             on_error: Box::new(on_error),
         });
@@ -192,10 +214,10 @@ impl MobileConvexClient {
                                 debug!("Updating with {value:?}");
                                 subscriber.on_update(serde_json::to_string(
                                     &serde_json::Value::from(value)
-                                ).unwrap())
+                                ).unwrap());
                             },
                             FunctionResult::ErrorMessage(message) => {
-                                subscriber.on_error(message, None)
+                                subscriber.on_error(message, None);
                             },
                             FunctionResult::ConvexError(error) => subscriber.on_error(
                                 error.message,
@@ -214,7 +236,6 @@ impl MobileConvexClient {
         });
         Ok(Arc::new(SubscriptionHandle::new(cancel_sender)))
     }
-
     #[frb]
     pub async fn mutation(
         &self,
